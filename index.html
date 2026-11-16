@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>見積もり計算</title>
+<style>
+  /* 画面全体の見た目（このファイルだけで完結。外部CSSなし） */
+  :root { --fg: #222; --bg: #f6f6f3; --card: #fff; --line: #d8d8d0; --accent: #2d6a4f; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg);
+    font-family: "Yu Gothic", "Meiryo", sans-serif; line-height: 1.6; }
+  main { max-width: 760px; margin: 0 auto; background: var(--card);
+    border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
+  h1 { font-size: 1.3rem; margin: 0 0 4px; }
+  .note { font-size: 0.85rem; color: #666; margin: 0 0 12px; }
+  table { width: 100%; border-collapse: collapse; margin-bottom: 12px; }
+  th, td { border-bottom: 1px solid var(--line); padding: 6px 4px; text-align: left; }
+  th { font-size: 0.85rem; color: #555; }
+  td.num, th.num { text-align: right; }
+  input, select { font: inherit; padding: 6px; border: 1px solid var(--line);
+    border-radius: 4px; width: 100%; background: #fff; }
+  input.qty { width: 70px; text-align: right; }
+  input.price { width: 110px; text-align: right; }
+  .opts { display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 12px; }
+  .opts label { display: block; font-size: 0.85rem; color: #555; }
+  .opts input, .opts select { width: 140px; }
+  button { font: inherit; padding: 8px 14px; border: 1px solid var(--accent);
+    background: var(--accent); color: #fff; border-radius: 4px; cursor: pointer; }
+  button.sub { background: #fff; color: var(--accent); }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .sum { margin-left: auto; width: 100%; max-width: 320px; }
+  .sum td { border: none; padding: 2px 4px; }
+  .sum tr.total td { font-weight: bold; font-size: 1.15rem; border-top: 2px solid var(--fg); }
+  .msg { min-height: 1.4em; font-size: 0.85rem; color: var(--accent); margin-top: 8px; }
+  .err { color: #b00020; }
+  /* 印刷時は操作部品を隠す */
+  @media print {
+    body { background: #fff; padding: 0; }
+    main { border: none; }
+    .actions, .msg, .noprint, button { display: none !important; }
+    input, select { border: none; padding: 0; appearance: none; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>見積もり計算</h1>
+  <p class="note">お見積もり日：<span id="today"></span></p>
+
+  <table id="items">
+    <thead>
+      <tr>
+        <th>品目</th>
+        <th class="num">数量</th>
+        <th class="num">単価（円）</th>
+        <th class="num">金額</th>
+        <th class="noprint"></th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <button type="button" class="sub noprint" id="addRow">行を追加</button>
+
+  <div class="opts" style="margin-top:12px">
+    <label>値引き（円）<input type="number" id="discount" min="0" step="1" value="0"></label>
+    <label>税率
+      <select id="taxRate">
+        <option value="10">10%（標準）</option>
+        <option value="8">8%（軽減）</option>
+      </select>
+    </label>
+  </div>
+
+  <table class="sum">
+    <tr><td>小計</td><td class="num" id="sSub">0円</td></tr>
+    <tr><td>値引き</td><td class="num" id="sDis">0円</td></tr>
+    <tr><td>消費税</td><td class="num" id="sTax">0円</td></tr>
+    <tr class="total"><td>税込合計</td><td class="num" id="sTotal">0円</td></tr>
+  </table>
+
+  <div class="actions">
+    <button type="button" id="copyBtn">明細をコピー</button>
+    <button type="button" id="printBtn">印刷</button>
+    <button type="button" class="sub" id="clearBtn">入力を空にする</button>
+  </div>
+  <p class="msg" id="msg" role="status"></p>
+</main>
+
+<script>
+(function () {
+  'use strict';
+
+  var MAX_ROWS = 30;          // 明細の最大行数
+  var STORE_KEY = 'html-tool-sample:estimate';
+
+  var rowsEl = document.getElementById('rows');
+  var msgEl = document.getElementById('msg');
+
+  // 数字を「1,234円」の形にする
+  function yen(n) { return n.toLocaleString('ja-JP') + '円'; }
+
+  // 入力値を0以上の整数にそろえる（空・負・文字は0）
+  function toInt(v) {
+    var n = Math.floor(Number(v));
+    return isFinite(n) && n > 0 ? n : 0;
+  }
+
+  // 計算本体：行の配列・値引き・税率(%)から各金額を返す（画面に依存しない）
+  function calc(items, discount, ratePct) {
+    var sub = 0;
+    items.forEach(function (it) { sub += it.qty * it.price; });
+    var dis = Math.min(toInt(discount), sub);   // 値引きは小計を超えない
+    var net = sub - dis;
+    var tax = Math.floor(net * ratePct / 100);  // 消費税は切り捨て（税抜合計に対して1回）
+    return { sub: sub, dis: dis, tax: tax, total: net + tax };
+  }
+
+  // 明細1行をつくる（値は後から代入するので、文字列をHTMLとして解釈しない）
+  function addRow(name, qty, price) {
+    if (rowsEl.children.length >= MAX_ROWS) { say('行は' + MAX_ROWS + '行までです。', true); return; }
+    var tr = document.createElement('tr');
+
+    var tdName = document.createElement('td');
+    var inName = document.createElement('input');
+    inName.type = 'text'; inName.maxLength = 60; inName.value = name || '';
+    inName.setAttribute('aria-label', '品目');
+    tdName.appendChild(inName);
+
+    var tdQty = document.createElement('td'); tdQty.className = 'num';
+    var inQty = document.createElement('input');
+    inQty.type = 'number'; inQty.min = '0'; inQty.step = '1'; inQty.className = 'qty';
+    inQty.value = qty == null ? '1' : String(qty);
+    inQty.setAttribute('aria-label', '数量');
+    tdQty.appendChild(inQty);
+
+    var tdPrice = document.createElement('td'); tdPrice.className = 'num';
+    var inPrice = document.createElement('input');
+    inPrice.type = 'number'; inPrice.min = '0'; inPrice.step = '1'; inPrice.className = 'price';
+    inPrice.value = price == null ? '0' : String(price);
+    inPrice.setAttribute('aria-label', '単価');
+    tdPrice.appendChild(inPrice);
+
+    var tdAmt = document.createElement('td'); tdAmt.className = 'num amt';
+    tdAmt.textContent = '0円';
+
+    var tdDel = document.createElement('td'); tdDel.className = 'noprint';
+    var del = document.createElement('button');
+    del.type = 'button'; del.className = 'sub'; del.textContent = '削除';
+    del.addEventListener('click', function () { tr.remove(); refresh(); });
+    tdDel.appendChild(del);
+
+    [tdName, tdQty, tdPrice, tdAmt, tdDel].forEach(function (td) { tr.appendChild(td); });
+    [inName, inQty, inPrice].forEach(function (i) { i.addEventListener('input', refresh); });
+    rowsEl.appendChild(tr);
+  }
+
+  // 画面の入力を読み取って配列にする
+  function readItems() {
+    return Array.prototype.map.call(rowsEl.children, function (tr) {
+      var ins = tr.querySelectorAll('input');
+      return { name: ins[0].value.trim(), qty: toInt(ins[1].value), price: toInt(ins[2].value) };
+    });
+  }
+
+  function currentRate() { return Number(document.getElementById('taxRate').value); }
+
+  // 再計算して画面に反映し、ブラウザ内に保存する
+  function refresh() {
+    var items = readItems();
+    var r = calc(items, document.getElementById('discount').value, currentRate());
+    Array.prototype.forEach.call(rowsEl.children, function (tr, i) {
+      tr.querySelector('.amt').textContent = yen(items[i].qty * items[i].price);
+    });
+    document.getElementById('sSub').textContent = yen(r.sub);
+    document.getElementById('sDis').textContent = (r.dis > 0 ? '-' : '') + yen(r.dis);
+    document.getElementById('sTax').textContent = yen(r.tax);
+    document.getElementById('sTotal').textContent = yen(r.total);
+    save();
+  }
+
+  function say(text, isErr) {
+    msgEl.textContent = text;
+    msgEl.className = 'msg' + (isErr ? ' err' : '');
+  }
+
+  // コピー用の明細テキストを作る
+  function buildText() {
+    var items = readItems().filter(function (it) { return it.name || it.qty * it.price > 0; });
+    var r = calc(readItems(), document.getElementById('discount').value, currentRate());
+    var lines = ['お見積もり（' + document.getElementById('today').textContent + '）'];
+    items.forEach(function (it) {
+      lines.push((it.name || '（品目名なし）') + ' ' + it.qty + ' × ' + yen(it.price) + ' = ' + yen(it.qty * it.price));
+    });
+    lines.push('小計 ' + yen(r.sub));
+    lines.push('値引き ' + (r.dis > 0 ? '-' : '') + yen(r.dis));
+    lines.push('消費税（' + currentRate() + '%） ' + yen(r.tax));
+    lines.push('税込合計 ' + yen(r.total));
+    return lines.join('\n');
+  }
+
+  // クリップボードにコピー。使えない場合は選択コピーに切り替える
+  function copyText(text) {
+    // 権限やフォーカスの都合で断られた場合も、選択コピーで再挑戦する
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text).catch(function () { return fallbackCopy(text); });
+    }
+    return fallbackCopy(text);
+  }
+
+  function fallbackCopy(text) {
+    return new Promise(function (resolve, reject) {
+      var ta = document.createElement('textarea');
+      ta.value = text; document.body.appendChild(ta); ta.select();
+      var ok = false;
+      try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+      ta.remove();
+      ok ? resolve() : reject(new Error('copy failed'));
+    });
+  }
+
+  // ブラウザ内保存（任意機能）。使えない環境では黙って何もしない
+  function save() {
+    try {
+      localStorage.setItem(STORE_KEY, JSON.stringify({
+        items: readItems(),
+        discount: toInt(document.getElementById('discount').value),
+        rate: currentRate()
+      }));
+    } catch (e) { /* 保存できなくても計算は続ける */ }
+  }
+
+  function load() {
+    try {
+      var raw = localStorage.getItem(STORE_KEY);
+      if (!raw) return false;
+      var d = JSON.parse(raw);
+      if (!d || !Array.isArray(d.items) || d.items.length === 0) return false;
+      d.items.slice(0, MAX_ROWS).forEach(function (it) {
+        addRow(String(it.name || ''), toInt(it.qty), toInt(it.price));
+      });
+      document.getElementById('discount').value = String(toInt(d.discount));
+      document.getElementById('taxRate').value = d.rate === 8 ? '8' : '10';
+      return true;
+    } catch (e) { return false; }
+  }
+
+  // 画面の初期化
+  var d = new Date();
+  document.getElementById('today').textContent =
+    d.getFullYear() + '年' + (d.getMonth() + 1) + '月' + d.getDate() + '日';
+
+  document.getElementById('addRow').addEventListener('click', function () { addRow('', 1, 0); refresh(); });
+  document.getElementById('discount').addEventListener('input', refresh);
+  document.getElementById('taxRate').addEventListener('change', refresh);
+  document.getElementById('copyBtn').addEventListener('click', function () {
+    copyText(buildText()).then(
+      function () { say('明細をコピーしました。', false); },
+      function () { say('コピーできませんでした。', true); });
+  });
+  document.getElementById('printBtn').addEventListener('click', function () { window.print(); });
+  document.getElementById('clearBtn').addEventListener('click', function () {
+    rowsEl.textContent = '';
+    document.getElementById('discount').value = '0';
+    document.getElementById('taxRate').value = '10';
+    addRow('', 1, 0);
+    refresh();
+    say('入力を空にしました。', false);
+  });
+
+  if (!load()) { addRow('', 1, 0); }
+  refresh();
+
+  // 計算の確認用に公開（テスト用。画面操作には使わない）
+  window.__estimateCalc = calc;
+})();
+</script>
+</body>
+</html>
